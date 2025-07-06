@@ -1,5 +1,5 @@
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import GRU, Dense
+from tensorflow.keras.layers import GRU, Dense, GaussianNoise
 
 def build_autoencoder(seq_len: int, latent_dim: int, feature_dim: int):
     """Builds the autoencoder components (encoder and recovery).
@@ -52,6 +52,7 @@ def build_discriminator(seq_len: int, latent_dim: int):
     """
     
     discriminator = Sequential(name="Discriminator")
+    discriminator.add(GaussianNoise(stddev=0.1, input_shape=(seq_len, latent_dim)))
     discriminator.add(GRU(units=latent_dim, return_sequences=True, input_shape=(seq_len, latent_dim)))
     discriminator.add(GRU(units=latent_dim, return_sequences=False)) # Reduces sequence to a vector for classification
     discriminator.add(Dense(units=1, activation='sigmoid'))
