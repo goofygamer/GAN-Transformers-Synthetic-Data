@@ -27,7 +27,7 @@ The following plot demonstrates the quality of the final model. It compares five
 
 
 ```
-![Results Comparison](assets/WGAN-GP.png)
+![Results Comparison](plots/WGAN-GP.png)
 ```
 
 ---
