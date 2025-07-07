@@ -55,6 +55,6 @@ def build_discriminator(seq_len: int, latent_dim: int):
     discriminator.add(GaussianNoise(stddev=0.1, input_shape=(seq_len, latent_dim)))
     discriminator.add(GRU(units=latent_dim, return_sequences=True, input_shape=(seq_len, latent_dim)))
     discriminator.add(GRU(units=latent_dim, return_sequences=False)) # Reduces sequence to a vector for classification
-    discriminator.add(Dense(units=1, activation='sigmoid'))
+    discriminator.add(Dense(units=1, activation=None)) 
 
     return discriminator

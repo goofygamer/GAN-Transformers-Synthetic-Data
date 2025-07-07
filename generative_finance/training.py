@@ -1,111 +1,115 @@
 import tensorflow as tf
-from tensorflow.keras.losses import BinaryCrossentropy, MeanSquaredError
 from tensorflow.keras.optimizers import Adam
 
 class TimeGANTrainer:
-    """An updated class to allow for flexible GAN training."""
+    """A class to encapsulate the WGAN-GP training logic."""
 
-    def __init__(self, models, latent_dim, learning_rates):
+    def __init__(self, models, latent_dim, learning_rates, gp_weight=10.0):
         self.encoder = models['encoder']
         self.recovery = models['recovery']
         self.generator = models['generator']
-        self.discriminator = models['discriminator']
+        self.critic = models['discriminator'] # Renamed for clarity
         self.latent_dim = latent_dim
+        self.gp_weight = gp_weight
 
-        # Accept separate learning rates for generator and discriminator
-        self.encoder_optimizer = Adam(learning_rate=learning_rates['autoencoder'])
-        self.recovery_optimizer = Adam(learning_rate=learning_rates['autoencoder'])
-        self.generator_optimizer = Adam(learning_rate=learning_rates['gan']['generator'])
-        self.discriminator_optimizer = Adam(learning_rate=learning_rates['gan']['discriminator'])
-        self.supervisor_optimizer = Adam(learning_rate=learning_rates['supervisor'])
+        # WGAN typically uses Adam with specific beta_1
+        self.encoder_optimizer = Adam(learning_rate=learning_rates['autoencoder'], beta_1=0.5, beta_2=0.9)
+        self.recovery_optimizer = Adam(learning_rate=learning_rates['autoencoder'], beta_1=0.5, beta_2=0.9)
+        self.generator_optimizer = Adam(learning_rate=learning_rates['gan']['generator'], beta_1=0.5, beta_2=0.9)
+        self.critic_optimizer = Adam(learning_rate=learning_rates['gan']['discriminator'], beta_1=0.5, beta_2=0.9)
+        self.supervisor_optimizer = Adam(learning_rate=learning_rates['supervisor'], beta_1=0.5, beta_2=0.9)
+
+    # --- WGAN Loss Functions ---
+    def _critic_loss(self, real_output, fake_output):
+        return tf.reduce_mean(fake_output) - tf.reduce_mean(real_output)
+
+    def _generator_loss(self, fake_output):
+        return -tf.reduce_mean(fake_output)
+
+    def _gradient_penalty(self, real_data, fake_data):
+        batch_size = tf.shape(real_data)[0]
+        alpha = tf.random.normal([batch_size, 1, 1], 0.0, 1.0)
+        diff = fake_data - real_data
+        interpolated = real_data + alpha * diff
+
+        with tf.GradientTape() as gp_tape:
+            gp_tape.watch(interpolated)
+            pred = self.critic(interpolated, training=True)
         
-        self.bce = BinaryCrossentropy()
-        self.mse = MeanSquaredError()
+        grads = gp_tape.gradient(pred, [interpolated])[0]
+        norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2]))
+        gp = tf.reduce_mean((norm - 1.0) ** 2)
+        return gp
 
+    # --- Training Steps ---
     @tf.function
     def _train_autoencoder_step(self, X):
         with tf.GradientTape() as tape:
             H = self.encoder(X)
             X_tilde = self.recovery(H)
-            e_loss = 10 * tf.sqrt(self.mse(X, X_tilde))
-
+            e_loss = tf.sqrt(tf.reduce_mean(tf.square(X - X_tilde))) * 10
         var_list = self.encoder.trainable_variables + self.recovery.trainable_variables
         gradients = tape.gradient(e_loss, var_list)
         self.encoder_optimizer.apply_gradients(zip(gradients, var_list))
-        return tf.sqrt(self.mse(X, X_tilde))
+        return e_loss
 
     @tf.function
     def _train_supervisor_step(self, X):
         with tf.GradientTape() as tape:
             H = self.encoder(X)
             H_hat_supervised = self.generator(H)
-            g_loss_s = self.mse(H, H_hat_supervised)
-
+            g_loss_s = tf.reduce_mean(tf.square(H - H_hat_supervised))
         var_list = self.generator.trainable_variables
         gradients = tape.gradient(g_loss_s, var_list)
         self.supervisor_optimizer.apply_gradients(zip(gradients, var_list))
         return g_loss_s
+        
+    @tf.function
+    def _train_critic_step(self, X, Z):
+        with tf.GradientTape() as tape:
+            H_real = self.encoder(X, training=True)
+            H_fake = self.generator(Z, training=True)
 
-    # --- SPLIT GAN TRAINING FUNCTIONS ---
+            real_output = self.critic(H_real, training=True)
+            fake_output = self.critic(H_fake, training=True)
+
+            critic_loss = self._critic_loss(real_output, fake_output)
+            gp = self._gradient_penalty(H_real, H_fake)
+            total_critic_loss = critic_loss + gp * self.gp_weight
+        
+        gradients = tape.gradient(total_critic_loss, self.critic.trainable_variables)
+        self.critic_optimizer.apply_gradients(zip(gradients, self.critic.trainable_variables))
+        return total_critic_loss
 
     @tf.function
-    def _train_gan_discriminator_step(self, X, Z):
-        """Trains only the discriminator for one step."""
+    def _train_generator_step(self, Z):
         with tf.GradientTape() as tape:
-            H = self.encoder(X, training=False) # Encoder is not trained here
-            H_hat = self.generator(Z, training=False) # Generator is not trained here
-
-            Y_real = self.discriminator(H)
-            Y_fake = self.discriminator(H_hat)
-
-            d_loss_real = self.bce(y_true=tf.ones_like(Y_real), y_pred=Y_real)
-            d_loss_fake = self.bce(y_true=tf.zeros_like(Y_fake), y_pred=Y_fake)
-            d_loss = d_loss_real + d_loss_fake
-
-        var_list = self.discriminator.trainable_variables
-        gradients = tape.gradient(d_loss, var_list)
-        self.discriminator_optimizer.apply_gradients(zip(gradients, var_list))
-        return d_loss
-
-    @tf.function
-    def _train_gan_generator_step(self, X, Z):
-        """Trains only the generator for one step."""
-        with tf.GradientTape() as tape:
-            H = self.encoder(X, training=False) # Encoder is not trained here
-            H_hat = self.generator(Z)
-            Y_fake = self.discriminator(H_hat, training=False) # Discriminator is not trained here
-            
-            g_loss_u = self.bce(y_true=tf.ones_like(Y_fake), y_pred=Y_fake)
-            g_loss_v = tf.reduce_mean(tf.abs(tf.sqrt(tf.nn.moments(H_hat, [0])[1] + 1e-6) - tf.sqrt(tf.nn.moments(H, [0])[1] + 1e-6)))
-            g_loss = g_loss_u + 100 * g_loss_v
-
-        var_list = self.generator.trainable_variables
-        gradients = tape.gradient(g_loss, var_list)
-        self.generator_optimizer.apply_gradients(zip(gradients, var_list))
-        return g_loss_u, g_loss_v
-
-    # --- UPDATED MAIN TRAINING LOOP ---
-
-    def train(self, data, epochs, batch_size, g_train_steps=1):
-        """The main training loop with adjustable generator training steps."""
+            H_fake = self.generator(Z, training=True)
+            fake_output = self.critic(H_fake, training=True)
+            g_loss = self._generator_loss(fake_output)
+        
+        gradients = tape.gradient(g_loss, self.generator.trainable_variables)
+        self.generator_optimizer.apply_gradients(zip(gradients, self.generator.trainable_variables))
+        return g_loss
+        
+    # --- Main Training Loop ---
+    def train(self, data, epochs, batch_size, critic_steps=5):
         seq_len = data.shape[1]
         for epoch in range(epochs):
             for X_batch in tf.data.Dataset.from_tensor_slices(data).shuffle(buffer_size=len(data)).batch(batch_size):
+                # Train Critic more than Generator
+                for _ in range(critic_steps):
+                    Z_batch = tf.random.normal(shape=(tf.shape(X_batch)[0], seq_len, self.latent_dim))
+                    step_c_loss = self._train_critic_step(X_batch, Z_batch)
+                
+                # Train Generator
                 Z_batch = tf.random.normal(shape=(tf.shape(X_batch)[0], seq_len, self.latent_dim))
-                
-                # 1. Train Autoencoder
-                step_e_loss = self._train_autoencoder_step(X_batch)
-                
-                # 2. Train Supervisor
-                step_g_loss_s = self._train_supervisor_step(X_batch)
-                
-                # 3. Train Discriminator (once per batch)
-                step_d_loss = self._train_gan_discriminator_step(X_batch, Z_batch)
+                step_g_loss = self._train_generator_step(Z_batch)
 
-                # 4. Train Generator (multiple steps per batch)
-                for _ in range(g_train_steps):
-                    step_g_loss_u, step_g_loss_v = self._train_gan_generator_step(X_batch, Z_batch)
-            
+                # Train Autoencoder and Supervisor (less frequently if desired)
+                step_e_loss = self._train_autoencoder_step(X_batch)
+                step_g_loss_s = self._train_supervisor_step(X_batch)
+
             if epoch % 10 == 0:
-                print(f"Epoch: {epoch}, E_loss: {step_e_loss:.4f}, G_loss_S: {step_g_loss_s:.4f}, "
-                      f"G_loss_U: {step_g_loss_u:.4f}, D_loss: {step_d_loss:.4f}")
+                print(f"Epoch: {epoch}, D_loss: {step_c_loss:.4f}, G_loss: {step_g_loss:.4f}, "
+                      f"E_loss: {step_e_loss:.4f}, G_loss_S: {step_g_loss_s:.4f}")
